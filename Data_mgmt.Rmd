@@ -1,0 +1,231 @@
+---
+title: "Markov Chain Monte Carlo vs GARCH"
+author: "Dirk Schut - 17298"
+date: "2027-01-05"
+output: html_notebook
+---
+
+Before data can be imported, the right packages need to be imported and loaded.
+
+```{r setup, include=FALSE}
+#install.packages("markovchain")
+#install.packages("ggplot2")
+#install.packages("ggpubr")
+#install.packages("xtable")
+#install.packages("randomForest")
+#install.packages("dplyr")
+#install.packages("rugarch")
+
+library(markovchain)
+library(ggplot2)
+library("ggpubr")
+library(xtable)
+library(randomForest)
+library(dplyr)
+library(rugarch)
+```
+
+```{r  reading data, include=FALSE}
+dat_raw <- read.csv("sp500_stocks.csv", header=TRUE, sep=",")
+
+
+```
+
+Here I define any variables used to impact the analysis or performing the simulation. These variables serve to make the model dynamic and to prevent static variables within the further code.
+
+```{r settings}
+k<- 5 # number of timesteps for moving average and moving std.dev.
+tracker<- "AIG" #selection of tracker from data. "
+set.seed(1) # set seed for reproducability
+classes <- 3 #set number of nodes allowed in the tree. This greatly reduces the number of terminal nodes (leaves) in the tree and therefore the number of states for out Markov Chain.Note: if you go beyond 26 states, the designation of state labels breaks down. 
+daysSim <- 250 #approximately 250 trading days in a year
+nSim <- 1000 #to reach a statistically significant number of simulations it is recommended to have at minimum 1000 simulations. For greater accuracy, higher numbers of simulations are advised
+init_date <- "2007-01-05" #starting point for the Markov Chain note: make sure the date ("YYYY-MM-DD") exists in the dataset
+init_cap <- 1 #starting capital 
+```
+
+After reading the data, select de course data from the tracker defined in the settings and add that to a different dataframe and enrich the dataframe with log-returns, and moving averages and standard deviations (st.dev. or sd). Also, care is taken to keep the dataset clean and to correct any N/A values
+
+```{r restructuring data}
+# Create a dataframe as a section of the raw data to be used
+dat_use<-data.frame(date=dat_raw$date[dat_raw$symbol==tracker],price=dat_raw$close[dat_raw$symbol==tracker])
+# Add logreturns as a column
+dat_use<-mutate(dat_use, log_returns=log(dat_use$price/lag(dat_use$price)))
+# Replace any N/A values by 0
+dat_use$log_returns[is.na(dat_use$log_returns)]<-0
+# Make 2 columns in which moving average and volatility will be stored during the loop
+temp_col1<-c()
+temp_col2<-c()
+# For-loop to generate moving average and volatilities
+for(i in 1:length(dat_use$log_returns)){
+  nr<-max(i-k,1) # moving avg and st.dev will be taken over 5 lagged values. At the start there won't be enough past values. This line determines the starting point of the array
+  temp_mean<-mean(dat_use$log_returns[nr:i]) # i-th moving average
+  temp_sd<-sqrt(var(dat_use$log_returns[nr:i])) #i-th moving standard deviation
+  temp_col1[i]<-temp_mean # storing the moving average in the temporary column
+  temp_col2[i]<- temp_sd # storing the moving std.dev in the temp column
+}
+dat_use<-mutate(dat_use, mov_avg=temp_col1, mov_sd=temp_col2) #appending the moving averages and moving st.dev to the dataframe
+dat_use$mov_avg[is.na(dat_use$mov_avg)]<-0 # replacing any N/A values with 0
+dat_use$mov_sd[is.na(dat_use$mov_sd)]<-0 # replacing any N/A values with 0
+```
+
+Here we start the Random Forest analysis to split the set in terminal nodes.
+
+```{r Randomforest}
+# to make sure the model doesn't use prices or dates as drivers for the model, a temporary dataframe is made with just log_returns, mov_avg and mov_st.dev
+dat_rf<-data.frame(log_ret=dat_use$log_returns, mov_avg=dat_use$mov_avg, mov_sd=dat_use$mov_sd) #expanding our data with moving average and std.dev.
+model <- randomForest(formula = log_ret ~., data = dat_rf, importance=TRUE, proximity=TRUE, maxnodes = classes) # here we fit our random forest model on the data, in this case all of the data is used for building the random forest, this can be done with just a subset if specific periods need to be modeled. 
+mod_b <- which.min(model$mse) #find the best tree with the best mean squared error
+tree <- getTree(model, k=mod_b, labelVar=FALSE) #let's look at the tree
+tree
+```
+
+With the Random Forest analysis done, it's time to start classifying the data according to their terminal nodes into states for the Markov Chain.
+
+```{r classification}
+
+temp_col3<-c() # temporary column to store node results
+for(j in 1:length(dat_use$log_returns)){
+  d.temp<-data.frame(mov_avg=dat_use$mov_avg[j],mov_sd=dat_use$mov_sd[j]) #load prediction data
+  pred<-predict(model,d.temp,nodes=TRUE) # make prediction, use 'nodes=TRUE' to gather terminal nodes
+  out_no<-attr(pred,"nodes") # isolate the nodes
+  temp_col3[j]<-out_no[mod_b] # grab the node given by the best performing tree
+}
+dat_use<-mutate(dat_use, node=temp_col3) #add nodes to data use
+
+nodes_un<-unique(dat_use$node) #reference nodes in data
+state_un<-c(letters[1:classes]) #reference states for transition matrix
+
+temp_col4<-c(state_un[1]) #set up for states, the first state will always be the first value of nodes_un and therefore mapped to the first state name, in this case 'A'
+for(l in 2:length(dat_use$node)){
+  temp_col4[l]<-state_un[nodes_un==dat_use$node[l]] #add state names based on node value
+}
+temp_col5<-c(paste(temp_col4[1],temp_col4[1],sep="")) #while not strictly true, we define the starting state as the first transition from the state to itself. With little data availabe this might skew results, however, the dataset is large enough for the error to not skew results. 
+for(m in 2:length(dat_use$node)){
+ temp_col5[m]<- paste(temp_col4[m-1],temp_col4[m],sep="") #add state transition by combining previous state and current state as the transition string
+}  
+
+dat_use<-mutate(dat_use, state=temp_col4, transition=temp_col5) #enriching the data with new states and transitions
+temp_col6<-c() # make temp column for all possible state transitions
+temp_col7<-c() # make temp column for origin states per transition
+
+for(n in 1:classes){ #first loop for state rows
+  for(o in 1:classes){ #second loop for columns
+    temp_col6<-c(temp_col6,paste(state_un[n],state_un[o],sep="")) #paste the combination of row state and column state
+    temp_col7<-c(temp_col7, state_un[n])
+  }
+}
+States <- data.frame(trans=temp_col6, origin=temp_col7)
+tallies<-dat_use |> count(transition) #count the number of appearances of a certain transition in the set
+transMat<-c() #setup for the transition matrix
+for(p in States$trans){ #loop through all possible tranistions
+  prob<-0 #set probability at 0 so if the transition isn't found
+  og <- States$origin[States$trans==p]
+  if(length(tallies$transition[tallies$transition==p])>0){#check whether the transition exists in the data
+    prob=tallies$n[tallies$transition==p]/length(dat_use$state[dat_use$state==og]) #if the transition can be found, define the probability by count divided by total observations, stored in prob, otherwise prob remains predefined at 0
+  }
+  transMat<-c(transMat,prob) #append the probability to the setup for the transition matrix
+}
+markovMat<-matrix(transMat, #turns trnasMat, an array, into a matrix with
+                 nrow=classes, #a nubmer of rows equalling the number of classes or states
+                 ncol=classes, #and the same for columns
+                 byrow = TRUE, #the array was defined by row as in the for-loop
+                 dimnames = list(state_un, state_un) #adding dimension names
+                 )
+```
+
+With the transition matrix complete for Markov Chain, we can set up the simulation for the Markov Chain Monte Carlo process. Initially the simulation will run for a year (there are approximately 250 trading days in a year, as markets close on the weekends and holidays)
+
+```{r Markov Chain Monte Carlo - singular execution}
+MCMC <- new("markovchain", states = state_un, transitionMatrix = markovMat) #initiailising the Markov Chain
+init_st <- dat_use$state[dat_use$date==init_date] #initialising the state
+MarkovPath <- rmarkovchain(n= daysSim, object = MCMC, t0 = init_st) # generating a markov chain path
+MonteRet <- c() #initiailising the returns array
+for(q in 1:length(MarkovPath)){
+  MonteRet[q]<-sample(dat_use$log_returns[dat_use$state==dat_use$state[q]],1,replace=TRUE) #for every element in the markov chain, there is a state we can use to draw log returns from in the data, we add the data to the reutrns
+}
+plot(x=c(1:length(MonteRet)), MonteRet, type="l")
+```
+
+This single pass shows periods of relative quiet with smaller peaks of volatility and bigger peaks of extreme volatility. this shows that our method provides the sought-after volatility clustering. Single passes aren't enough to determine VaR, so we take previous method, make it a function and perform multiple simulations. These simulations are translated back to a price such that loss may be determined and tracked.
+
+```{r Markov Chain Monte Carlo - plural function}
+MCsquared <- function(TransMat, data, startDate, startCap, stateList, nDays, Sims){
+  MCMC <- new("markovchain", states = stateList, transitionMatrix = TransMat) #set the markov chain
+  init_st <- data$state[data$date==startDate] #initialise the starting state
+  price<-c(startCap) #set starting price
+  priceSim<-c() #initialise the output array
+  for(r in 1:Sims){ #simulation loop
+    MRet <- c() #initialise the returns for this loop
+    MarkovPath <- rmarkovchain(n= nDays, object = MCMC, t0 = init_st) #create a markov chain
+    for(q in 1:length(MarkovPath)){ #loop through the morkov chain
+      MRet[q]<-sample(dat_use$log_returns[dat_use$state==dat_use$state[q]],1,replace=TRUE) #create a return for every element in the markov chain
+    }
+    for(s in 1:nDays){#days loop, to create price curve
+      price[s+1]<-price[s]*exp(MRet[s]) #price curve starts with starting capital/price and changes due to multiplying the current price with the exponent of hte log-returns
+    }
+    priceSim<-cbind(priceSim, price) #when the sim is complete, add the price curve to the price curves output
+  }
+  return(priceSim) #return the price curves, each column is a simulation
+  }
+```
+
+Now we load our function and determine our price matrices
+
+```{r Markov Chain Monte Carlo - plural execution}
+rownames<-c("start") #initialise row labels
+for(t in 1:daysSim){
+  rownames<-c(rownames,paste("day_",t,sep="")) #create labels for the rows
+}
+colnames<-c() #initialise column labels
+for(u in 1:nSim){
+  colnames<-c(colnames,paste("path_",u,sep="")) #create labels for the column
+}
+pMat<-MCsquared(markovMat, dat_use, init_date, init_cap, state_un, daysSim, nSim) #create a simulation of X days and Y simulated price curves
+lossMat<-matrix(c(init_cap-pMat), ncol=nSim, nrow=daysSim+1, dimnames=list(rownames,colnames)) #create a matrix for the losses, positive numbers mean default wrt starting capital, negative numbers means a profit was made
+pMat<-matrix(pMat, ncol=nSim, nrow=daysSim+1, dimnames=list(rownames,colnames)) #reformatting the prices such that they too are labeled in a matrix. 
+
+```
+
+Next up is GARCH
+
+```{r GARCH}
+conSet <- ugarchspec(
+  variance.model     = list(model = "sGARCH", garchOrder = c(1,1)),
+  mean.model         = list(armaOrder = c(0, 0), include.mean = TRUE),
+  distribution.model = "norm") #set-up of the model
+print("the model is configured as follows:")
+conSet
+control<-ugarchfit(spec = conSet, data = dat_use$log_returns, solver = "hybrid") #fitting the model to log-returns
+print("the fit is af follows:")
+show(control)
+coefControl <- control@fit$matcoef #store coefficients
+print("The coefficcients are:")
+coefControl #display coefficients
+
+persControl<- unname(coefControl[3]+ coefControl[4]) #store the persistence A1+B1
+foreT<-function(sdLast, nDays, pers, omega){ #set up a forecasting volatility function
+  varN<-omega+pers*sdLast^2 #calculate the first value
+  out<-c(varN) #store the first value in an array
+  for(v in 2:nDays){ #loop over the simulated days, starting with day 2 as day 1 we already have
+    out[v]<-omega+pers*out[v-1]^2 #add the new variances
+  }
+  return(sqrt(out[v])) #return the last value as sd instead of variance
+}
+sdSimGarch<-foreT(dat_use$mov_sd[dat_use$date==init_date],daysSim,persControl,coefControl[2]) #run the forcast and store in variable
+print("there are hte persistence, long run variance and sd and half-life of shocks")
+c(persistence = persControl,
+        long_run_var = unname(coefControl[2]) / (1 - persControl),
+        long_run_sd  = sqrt(unname(coefControl[2]) / (1 - persControl)),
+        half_life    = log(0.5) / log(persControl))
+print("GARCH simulated 1-year sd")
+sdSimGarch
+print("sanity check, sd of the data provides:")
+sd(dat_use$log_returns)
+print("the yearly log-return is(%):")
+(exp(coefControl[1]*daysSim)-1)*100 #exp(mu*t), mu=a0, t=daysSim=250, subtract 1 to the return, multiply by 100 to get percentages
+print("the sample mean log-return after 250 days is:")
+(exp(mean(dat_use$log_returns)*daysSim)-1)*100
+```
+
+Surprisingly, this model yields almost no static adjustment of log-returns. This would indicate that after 250 trading days, there is an expected 6,4% return on investment. Also clear: the long term sd is not equal to the 1 year sd. The GARCH long term sd does approach the sample sd. Interestingly, the mean logreturns of the whole dataset will lead to a negative return. This may be due to certain stockmarket crashes and recessions between 2008 and 2012 as well as the global crash due to a blocked Suez canal and the Russian occupation in Ukraine.
